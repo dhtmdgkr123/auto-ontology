@@ -18,6 +18,7 @@ from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from pydantic import BaseModel, ConfigDict, ValidationError, model_validator
 
+from auto_ontology.utils import bedrock
 from auto_ontology.utils.model_config import resolve
 
 logger = logging.getLogger(__name__)
@@ -154,6 +155,12 @@ _RETRYABLE_TOKENS = (
     "AzureException",
     "InternalServerError",
     "litellm",
+    # Bedrock. botocore's ClientError names the error code, never the HTTP status.
+    "ThrottlingException",
+    "ServiceUnavailableException",
+    "ModelNotReadyException",
+    "ModelTimeoutException",
+    "InternalServerException",
 )
 
 # Exception *type* names that are always transient/retryable regardless of
@@ -172,6 +179,11 @@ _RETRYABLE_EXCEPTION_TYPES = frozenset(
         "APITimeoutError",
         "RateLimitError",
         "ServiceUnavailableError",
+        # botocore transport errors (Bedrock); their messages carry none of the
+        # tokens above.
+        "ReadTimeoutError",
+        "ConnectTimeoutError",
+        "EndpointConnectionError",
     }
 )
 
@@ -211,6 +223,32 @@ _NON_REASONING_MODEL_NAME = resolve("NON_REASONING", "MODEL")
 _NON_REASONING_API_KEY = resolve("NON_REASONING", "API_KEY")
 
 
+def _build_bedrock_client(
+    *, model: str, temperature: float, max_tokens: int
+) -> BaseChatModel:
+    """Build a Bedrock Converse client for a ``bedrock/`` model.
+
+    Credentials and region come from the standard AWS chain (see
+    :mod:`auto_ontology.utils.bedrock`), so the triplet's API key and endpoint
+    are not used. *temperature* reaches the models that take one; for a model
+    whose langchain-aws profile says it takes none (the current Claude models),
+    langchain-aws leaves it out of the request, with a warning, instead of
+    letting Bedrock reject the call.
+    """
+    from langchain_aws import ChatBedrockConverse
+
+    return ChatBedrockConverse(
+        model=bedrock.model_id(model),
+        region_name=bedrock.arn_region(model),
+        temperature=temperature,
+        max_tokens=max_tokens,
+        timeout=LLM_INVOKE_TIMEOUT_S,
+        # Retries happen here, with backoff and the inflight bound, as for
+        # ChatOpenAI below.
+        max_retries=0,
+    )
+
+
 def _build_client(
     *,
     model: str,
@@ -221,10 +259,16 @@ def _build_client(
 ) -> BaseChatModel:
     """Build a chat client for the given model/endpoint.
 
-    OpenAI-family models (``openai/``, ``azure/``, ``aws/`` prefixes) go through
-    ``ChatOpenAI``, which supports structured output. Everything else uses
-    ``ChatNVIDIA``.
+    ``bedrock/`` models call Amazon Bedrock through ``ChatBedrockConverse`` and
+    ignore *api_key* and *base_url*. OpenAI-family models (``openai/``, ``azure/``,
+    ``aws/`` prefixes) go through ``ChatOpenAI``, which supports structured
+    output. Everything else uses ``ChatNVIDIA``.
     """
+    if bedrock.is_bedrock_model(model):
+        return _build_bedrock_client(
+            model=model, temperature=temperature, max_tokens=max_tokens
+        )
+
     if model.startswith(("openai/", "azure/", "aws/")):
         from langchain_openai import ChatOpenAI
 
@@ -267,11 +311,12 @@ def get_llm_client(
     model : str | None
         Override the default ``REASONING_MODEL`` env var for this client.
     """
-    if not _API_KEY:
+    model = model or _MODEL_NAME
+    if not _API_KEY and not bedrock.is_bedrock_model(model):
         raise EnvironmentError("REASONING_API_KEY is not set")
 
     return _build_client(
-        model=model or _MODEL_NAME,
+        model=model,
         api_key=_API_KEY,
         base_url=_BASE_URL,
         temperature=temperature,
@@ -296,11 +341,12 @@ def get_non_reasoning_llm_client(
     model : str | None
         Override the default ``NON_REASONING_MODEL`` env var for this client.
     """
-    if not _NON_REASONING_API_KEY:
+    model = model or _NON_REASONING_MODEL_NAME
+    if not _NON_REASONING_API_KEY and not bedrock.is_bedrock_model(model):
         raise EnvironmentError("NON_REASONING_API_KEY is not set")
 
     client = _build_client(
-        model=model or _NON_REASONING_MODEL_NAME,
+        model=model,
         api_key=_NON_REASONING_API_KEY,
         base_url=_NON_REASONING_BASE_URL,
         temperature=temperature,
@@ -417,7 +463,13 @@ def _ensure_non_system_message(messages: list[BaseMessage]) -> list[BaseMessage]
 
 def _is_claude(llm: BaseChatModel) -> bool:
     """True when *llm* serves an Anthropic/Claude model, matched by name."""
-    model = str(getattr(llm, "model_name", "") or getattr(llm, "model", "") or "")
+    model = str(
+        getattr(llm, "model_name", "")
+        or getattr(llm, "model", "")
+        # ChatBedrockConverse keeps its model under ``model_id``.
+        or getattr(llm, "model_id", "")
+        or ""
+    )
     lowered = model.lower()
     return "anthropic" in lowered or "claude" in lowered
 
@@ -428,8 +480,8 @@ def _system_messages_first(
     """Move every system message ahead of the conversation for Claude models.
 
     Claude takes a single system prompt ahead of the conversation, but agents
-    interleave them: ``sql_from_semantic`` sends system, user, system, system,
-    user, and a validation retry appends a system message after the user turn.
+    can interleave them, e.g. system, user, system, system, user, or a retry
+    that appends a system message after the user turn.
     On the inference-api gateway, ``azure/anthropic/*`` rejects every request
     with a system message after a user message, because the gateway attaches
     prompt-cache markers in an order Anthropic refuses::
@@ -477,10 +529,22 @@ def _structured_output_kwargs(llm: BaseChatModel) -> dict:
     return {}
 
 
-def _invoke_text_once(llm: BaseChatModel, prompt: str) -> str:
-    response = llm.invoke([HumanMessage(content=prompt)])
+def _response_text(response: object) -> str:
+    """The answer text of an LLM response, without reasoning blocks.
+
+    A thinking model can return ``content`` as a list of blocks: Claude on Bedrock
+    puts a ``reasoning_content`` block (empty text plus an opaque signature) ahead
+    of the answer, and ``str(content)`` would return that whole list.
+    ``BaseMessage.text`` keeps only the text blocks.
+    """
+    if isinstance(response, BaseMessage):
+        return str(response.text)
     content = getattr(response, "content", response)
     return content if isinstance(content, str) else str(content)
+
+
+def _invoke_text_once(llm: BaseChatModel, prompt: str) -> str:
+    return _response_text(llm.invoke([HumanMessage(content=prompt)]))
 
 
 def invoke_text(llm: BaseChatModel, prompt: str) -> str:
@@ -511,8 +575,7 @@ def _safe_invoke_text(llm: BaseChatModel, prompt: str) -> str:
         try:
             with _inflight_guard():
                 response = llm.invoke(messages)
-            content = getattr(response, "content", response)
-            return content if isinstance(content, str) else str(content)
+            return _response_text(response)
         except _requests.exceptions.ReadTimeout:
             logger.error(
                 "LLM invoke timed out after %ds on attempt %d/%d",
@@ -539,6 +602,42 @@ def _safe_invoke_text(llm: BaseChatModel, prompt: str) -> str:
                 continue
             raise
     raise RuntimeError("safe_invoke_text exhausted retries")
+
+
+def invoke_with_retry(
+    llm: BaseChatModel,
+    messages: list[BaseMessage],
+    *,
+    max_attempts: int = RETRY_MAX_ATTEMPTS,
+    base_wait: float = 2.0,
+    max_wait: float = 60.0,
+):
+    """``llm.invoke(messages)``, retried with exponential backoff on transient errors.
+
+    For a caller whose call sits in the middle of a longer conversation, where
+    giving up means losing everything said so far. The waits double from
+    *base_wait* up to *max_wait*, which is how long a saturated or
+    rate-limited endpoint needs; the shorter waits of the other helpers here
+    do not outlast it. An error that is not transient is raised at once, and
+    so is the last one once the attempts run out.
+    """
+    for attempt in range(max(max_attempts, 1)):
+        try:
+            with _inflight_guard():
+                return llm.invoke(messages)
+        except Exception as e:
+            if not _is_retryable(e) or attempt >= max_attempts - 1:
+                raise
+            wait = min(max_wait, base_wait * 2**attempt) + random.uniform(0, 1)
+            logger.warning(
+                "Retryable LLM error on attempt %d/%d — retrying in %.1fs: %s",
+                attempt + 1,
+                max_attempts,
+                wait,
+                str(e)[:120],
+            )
+            time.sleep(wait)
+    raise RuntimeError("invoke_with_retry exhausted its attempts")
 
 
 def safe_invoke_text(llm: BaseChatModel, prompt: str) -> str:
